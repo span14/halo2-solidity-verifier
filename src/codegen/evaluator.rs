@@ -120,6 +120,128 @@ where
         .collect()
     }
 
+    #[cfg(feature = "mv-lookup")]
+    pub fn lookup_computations(&self) -> Vec<(Vec<String>, String)> {
+        let evaluate = |expressions: &Vec<_>| {
+            let (lines, inputs) = expressions
+                .iter()
+                .map(|expression| self.evaluate(expression))
+                .fold((Vec::new(), Vec::new()), |mut acc, result| {
+                    acc.0.extend(result.0);
+                    acc.1.push(result.1);
+                    acc
+                });
+            self.reset();
+            (lines, inputs)
+        };
+        let inputs_tables = self
+            .cs
+            .lookups()
+            .iter()
+            .map(|lookup| {
+                let inputs = lookup
+                    .input_expressions()
+                    .iter()
+                    .map(evaluate)
+                    .collect_vec();
+                let table = evaluate(lookup.table_expressions());
+                (inputs, table)
+            })
+            .collect_vec();
+        izip!(inputs_tables, &self.data.lookup_evals)
+            .flat_map(|(inputs_tables, evals)| {
+                let (inputs, (table_lines, tables)) = inputs_tables;
+                let num_inputs = inputs.len();
+                let (table_0, rest_tables) = tables.split_first().unwrap();
+                let (phi, phi_next, m) = evals;
+                [
+                    vec![
+                        format!("let l_0 := mload(L_0_MPTR)"),
+                        format!("let eval := mulmod(l_0, {phi}, r)"),
+                    ],
+                    vec![
+                        format!("let l_last := mload(L_LAST_MPTR)"),
+                        format!("let eval := mulmod(l_last, {phi}, r)"),
+                    ],
+                    chain![
+                        [
+                            "let theta := mload(THETA_MPTR)",
+                            "let beta := mload(BETA_MPTR)",
+                            "let table"
+                        ]
+                        .map(str::to_string),
+                        code_block::<1, false>(chain![
+                            table_lines,
+                            [format!("table := {table_0}")],
+                            rest_tables.iter().map(|table| format!(
+                                "table := addmod(mulmod(table, theta, r), {table}, r)"
+                            )),
+                            [format!("table := addmod(table, beta, r)")],
+                        ]),
+                        izip!(0.., inputs.into_iter()).flat_map(|(idx, (input_lines, inputs))| {
+                            let (input_0, rest_inputs) = inputs.split_first().unwrap();
+                            let ident = format!("input_{idx}");
+                            chain![
+                                [format!("let {ident}")],
+                                code_block::<1, false>(chain![
+                                    input_lines,
+                                    [format!("{ident} := {input_0}")],
+                                    rest_inputs.iter().map(|input| format!(
+                                        "{ident} := addmod(mulmod({ident}, theta, r), {input}, r)"
+                                    )),
+                                    [format!("{ident} := addmod({ident}, beta, r)")],
+                                ]),
+                            ]
+                        }),
+                        [format!("let lhs"), format!("let rhs")],
+                        (0..num_inputs).flat_map(|i| {
+                            assert_ne!(num_inputs, 0);
+                            if num_inputs == 1 {
+                                vec![format!("rhs := table")]
+                            } else {
+                                let idents = (0..num_inputs)
+                                    .filter(|j| *j != i)
+                                    .map(|idx| format!("input_{idx}"))
+                                    .collect_vec();
+                                let (ident_0, rest_idents) = idents.split_first().unwrap();
+                                code_block::<1, false>(chain![
+                                    [format!("let tmp := {ident_0}")],
+                                    chain![rest_idents]
+                                        .map(|ident| format!("tmp := mulmod(tmp, {ident}, r)")),
+                                    [format!("rhs := addmod(rhs, tmp, r)"),],
+                                    (i == num_inputs - 1)
+                                        .then(|| format!("rhs := mulmod(rhs, table, r)")),
+                                ])
+                            }
+                        }),
+                        code_block::<1, false>(chain![
+                            [format!("let tmp := input_0")],
+                            (1..num_inputs)
+                                .map(|idx| format!("tmp := mulmod(tmp, input_{idx}, r)")),
+                            [
+                                format!("rhs := addmod(rhs, sub(r, mulmod({m}, tmp, r)), r)"),
+                                {
+                                    let item = format!("addmod({phi_next}, sub(r, {phi}), r)");
+                                    format!("lhs := mulmod(mulmod(table, tmp, r), {item}, r)")
+                                },
+                            ],
+                        ]),
+                        {
+                            let l_inactive = "addmod(mload(L_BLIND_MPTR), mload(L_LAST_MPTR), r)";
+                            let l_active = format!("addmod(1, sub(r, {l_inactive}), r)");
+                            [format!(
+                                "let eval := mulmod({l_active}, addmod(lhs, sub(r, rhs), r), r)"
+                            )]
+                        },
+                    ]
+                    .collect_vec(),
+                ]
+            })
+            .zip(iter::repeat("eval".to_string()))
+            .collect_vec()
+    }
+
+    #[cfg(not(feature = "mv-lookup"))]
     pub fn lookup_computations(&self) -> Vec<(Vec<String>, String)> {
         let evaluate = |expressions: &Vec<_>| {
             let (lines, inputs) = expressions

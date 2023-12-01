@@ -25,6 +25,7 @@ halo2_maingate  = { git = "https://github.com/span14/halo2wrong", branch = "ezkl
 [features]
 default = []
 evm = ["dep:revm"]
+mv-lookup = ["halo2_proofs/mv-lookup", "halo2_maingate/mv-lookup"]
 
 [[example]]
 name = "separately"
